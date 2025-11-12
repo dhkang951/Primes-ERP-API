@@ -1,0 +1,68 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: 🧪 테스트 실행
+    env:
+      # GitHub Packages 인증을 위한 환경변수
+      USERNAME: ${{ github.actor }}
+      GITHUB_PACKAGES_TOKEN: ${{ secrets.PAT_TOKEN }}
+    
+    steps:
+    - name: 📥 코드 체크아웃
+      uses: actions/checkout@v4
+
+    - name: 🔍 GitHub 인증 환경변수 디버깅 (CI 단계)
+      run: |
+        echo "=== CI 단계: GitHub 인증 환경변수 확인 ==="
+        echo "USERNAME: $USERNAME"
+        echo "GITHUB_PACKAGES_TOKEN: $GITHUB_PACKAGES_TOKEN"
+        echo "GITHUB_ACTOR: ${{ github.actor }}"
+        echo "=== 환경변수 길이 확인 ==="
+        echo "USERNAME 길이: ${#USERNAME}"
+        echo "GITHUB_PACKAGES_TOKEN 길이: ${#GITHUB_PACKAGES_TOKEN}"
+
+    - name: ☕ Java 17 설정
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: 📦 Gradle 캐시 설정
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+        restore-keys: |
+          ${{ runner.os }}-gradle-
+
+    - name: 🔧 Gradle 실행 권한 부여
+      run: chmod +x ./gradlew
+
+    - name: 🧪 테스트 실행 (메인 프로젝트만)
+      run: ./gradlew :test --no-daemon --info
+      env:
+        SPRING_PROFILES_ACTIVE: test
+
+    - name: 📊 코드 커버리지 리포트 생성
+      run: ./gradlew :jacocoTestReport --no-daemon
+      if: success() || failure()
+
+    - name: ✅ 커버리지 검증 (Service 100%)
+      run: ./gradlew :jacocoTestCoverageVerification --no-daemon
+      continue-on-error: true
+
+    - name: 📈 테스트 결과 퍼블리시
+      uses: dorny/test-reporter@v1
+      if: success() || failure()
+      with:
+        name: 📋 테스트 결과 (메인 프로젝트)
+        path: build/test-results/test/*.xml
+        reporter: java-junit

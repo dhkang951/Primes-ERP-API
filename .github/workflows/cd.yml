@@ -1,0 +1,718 @@
+name: CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    name: 도커 이미지 빌드 및 ECR 푸시
+    env:
+      # GitHub Packages 인증을 위한 환경변수
+      USERNAME: ${{ github.actor }}
+      GITHUB_PACKAGES_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 📋 환경변수 설정
+        run: |
+          # 기본 환경변수 설정
+          echo "AWS_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+          echo "GOOGLE_CHAT_WEBHOOK_URL=${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}" >> $GITHUB_ENV
+
+          SERVICE_NAME=erp-service
+
+          # ECR 리포지토리 설정 (primes/서비스명 형식)
+          if [ -n "${{ secrets.ECR_REPOSITORY }}" ]; then
+            echo "ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}" >> $GITHUB_ENV
+          else
+            # 기본값: primes/erp-service
+            echo "ECR_REPOSITORY=primes/${SERVICE_NAME}" >> $GITHUB_ENV
+            echo "✅ ECR 리포지토리를 설정했습니다: primes/${SERVICE_NAME}"
+          fi
+
+          # ECS 클러스터 설정
+          if [ -n "${{ secrets.ECS_CLUSTER }}" ]; then
+            echo "ECS_CLUSTER=${{ secrets.ECS_CLUSTER }}" >> $GITHUB_ENV
+          else
+            # 기본값: primes
+            echo "ECS_CLUSTER=primes" >> $GITHUB_ENV
+            echo "✅ ECS 클러스터를 설정했습니다: primes"
+          fi
+
+          # ECS 서비스 설정
+          if [ -n "${{ secrets.ECS_SERVICE }}" ]; then
+            echo "ECS_SERVICE=${{ secrets.ECS_SERVICE }}" >> $GITHUB_ENV
+          else
+            # 기본값: primes-erp-service
+            ECS_SERVICE="primes-${SERVICE_NAME}"
+            echo "ECS_SERVICE=$ECS_SERVICE" >> $GITHUB_ENV
+            echo "✅ ECS 서비스를 설정했습니다: $ECS_SERVICE"
+          fi
+
+          # ECS 태스크 정의 설정
+          if [ -n "${{ secrets.ECS_TASK_DEFINITION }}" ]; then
+            echo "ECS_TASK_DEFINITION=${{ secrets.ECS_TASK_DEFINITION }}" >> $GITHUB_ENV
+          else
+            # 기본값: primes-erp
+            ECS_TASK_DEF="primes-erp"
+            echo "ECS_TASK_DEFINITION=$ECS_TASK_DEF" >> $GITHUB_ENV
+            echo "✅ ECS 태스크 정의를 설정했습니다: $ECS_TASK_DEF"
+          fi
+
+          # ECS 컨테이너 이름 설정
+          if [ -n "${{ secrets.ECS_CONTAINER_NAME }}" ]; then
+            echo "ECS_CONTAINER_NAME=${{ secrets.ECS_CONTAINER_NAME }}" >> $GITHUB_ENV
+          else
+            # 기본값: erp-service-container
+            ECS_CONTAINER="${SERVICE_NAME}-container"
+            echo "ECS_CONTAINER_NAME=$ECS_CONTAINER" >> $GITHUB_ENV
+            echo "✅ ECS 컨테이너 이름을 설정했습니다: $ECS_CONTAINER"
+          fi
+
+          echo "=== 설정된 환경변수 ==="
+          echo "서비스명: ${SERVICE_NAME}"
+          echo "ECR_REPOSITORY: primes/${SERVICE_NAME}"
+          echo "ECS_CLUSTER: primes"
+          echo "ECS_SERVICE: primes-${SERVICE_NAME}"
+          echo "ECS_TASK_DEFINITION: primes-erp"
+          echo "ECS_CONTAINER_NAME: ${SERVICE_NAME}-container"
+
+      - name: ⚙️ AWS 자격 증명 설정
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: "🔍 디버깅: 환경변수 확인"
+        run: |
+          echo "=== 환경변수 디버깅 ==="
+          echo "AWS_REGION: ${{ env.AWS_REGION }}"
+          echo "ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}"
+          echo "ECS_CLUSTER: ${{ env.ECS_CLUSTER }}"
+          echo "ECS_SERVICE: ${{ env.ECS_SERVICE }}"
+          echo "ECS_TASK_DEFINITION: ${{ env.ECS_TASK_DEFINITION }}"
+          echo "ECS_CONTAINER_NAME: ${{ env.ECS_CONTAINER_NAME }}"
+          echo "=== GitHub 인증 환경변수 확인 ==="
+          echo "USERNAME: $USERNAME"
+          echo "TOKEN: $TOKEN"
+          echo "ORG_GRADLE_PROJECT_gpr_user: $ORG_GRADLE_PROJECT_gpr_user"
+          echo "ORG_GRADLE_PROJECT_gpr_key: $ORG_GRADLE_PROJECT_gpr_key"
+          echo "GITHUB_ACTOR: ${{ github.actor }}"
+          echo "GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}"
+          echo "GITHUB_PACKAGES_TOKEN: $GITHUB_PACKAGES_TOKEN"
+          echo "=== 환경변수 길이 확인 ==="
+          echo "USERNAME 길이: ${#USERNAME}"
+          echo "TOKEN 길이: ${#TOKEN}"
+          echo "GITHUB_PACKAGES_TOKEN 길이: ${#GITHUB_PACKAGES_TOKEN}"
+          echo "=== AWS 자격증명 확인 ==="
+          aws sts get-caller-identity
+          echo "=== ECR 저장소 목록 확인 ==="
+          aws ecr describe-repositories --region ${{ env.AWS_REGION }} || echo "ECR 저장소 목록 조회 실패"
+
+      - name: 🔑 Amazon ECR 로그인
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 🏷️ 이미지 태그 생성
+        id: image-tag
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "IMAGE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🔧 ECR 리포지토리 확인 및 생성
+        run: |
+          echo "=== ECR 리포지토리 확인: ${{ env.ECR_REPOSITORY }} ==="
+          if aws ecr describe-repositories --repository-names "${{ env.ECR_REPOSITORY }}" --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "✅ ECR 리포지토리 '${{ env.ECR_REPOSITORY }}'가 이미 존재합니다."
+          else
+            echo "⚠️ ECR 리포지토리 '${{ env.ECR_REPOSITORY }}'가 존재하지 않습니다. 생성합니다..."
+            aws ecr create-repository \
+              --repository-name "${{ env.ECR_REPOSITORY }}" \
+              --region ${{ env.AWS_REGION }} \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256
+            echo "✅ ECR 리포지토리 '${{ env.ECR_REPOSITORY }}'를 성공적으로 생성했습니다."
+            aws ecr put-lifecycle-policy \
+              --repository-name "${{ env.ECR_REPOSITORY }}" \
+              --region ${{ env.AWS_REGION }} \
+              --lifecycle-policy-text '{
+                "rules": [
+                  {
+                    "rulePriority": 1,
+                    "description": "Keep last 10 tagged images",
+                    "selection": {
+                      "tagStatus": "tagged",
+                      "countType": "imageCountMoreThan",
+                      "countNumber": 10
+                    },
+                    "action": { "type": "expire" }
+                  },
+                  {
+                    "rulePriority": 2,
+                    "description": "Delete untagged images older than 1 day",
+                    "selection": {
+                      "tagStatus": "untagged",
+                      "countType": "sinceImagePushed",
+                      "countUnit": "days",
+                      "countNumber": 1
+                    },
+                    "action": { "type": "expire" }
+                  }
+                ]
+              }' || echo "⚠️ 라이프사이클 정책 설정 실패 (무시됨)"
+          fi
+
+      - name: "🐛 디버깅: 이미지 빌드 전 변수 확인"
+        run: |
+          echo "=== 빌드 전 변수 확인 ==="
+          echo "ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}"
+          echo "ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}"
+          echo "IMAGE_TAG: ${{ steps.image-tag.outputs.IMAGE_TAG }}"
+          if [ -z "${{ steps.login-ecr.outputs.registry }}" ]; then echo "❌ ECR_REGISTRY가 비어있습니다!"; exit 1; fi
+          if [ -z "${{ env.ECR_REPOSITORY }}" ]; then echo "❌ ECR_REPOSITORY가 비어있습니다!"; exit 1; fi
+          if [ -z "${{ steps.image-tag.outputs.IMAGE_TAG }}" ]; then echo "❌ IMAGE_TAG가 비어있습니다!"; exit 1; fi
+          EXPECTED_IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.IMAGE_TAG }}"
+          echo "예상 이미지 URI: $EXPECTED_IMAGE_URI"
+
+      - name: 🏗️ 도커 이미지 빌드 및 ECR 푸시
+        id: build_image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ steps.image-tag.outputs.IMAGE_TAG }}
+        run: |
+          echo "=== 도커 이미지 빌드 시작 ==="
+          echo "ECR_REGISTRY: $ECR_REGISTRY"
+          echo "ECR_REPOSITORY: $ECR_REPOSITORY"
+          echo "IMAGE_TAG: $IMAGE_TAG"
+          if [ -z "$ECR_REGISTRY" ] || [ -z "$ECR_REPOSITORY" ] || [ -z "$IMAGE_TAG" ]; then
+            echo "❌ 필수 변수가 비어있습니다!"; exit 1
+          fi
+          FULL_IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "최종 이미지 URI: $FULL_IMAGE_URI"
+          echo "=== 도커 이미지 빌드 ==="
+          docker build \
+            --build-arg GITHUB_USERNAME=${{ github.actor }} \
+            --build-arg GITHUB_PACKAGES_TOKEN=${{ secrets.PAT_TOKEN }} \
+            -t "$FULL_IMAGE_URI" .
+          docker build \
+            --build-arg GITHUB_USERNAME=${{ github.actor }} \
+            --build-arg GITHUB_PACKAGES_TOKEN=${{ secrets.PAT_TOKEN }} \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
+          echo "=== ECR 푸시 ==="
+          docker push "$FULL_IMAGE_URI"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          echo "=== 빌드 완료 ==="
+          echo "✅ 도커 이미지 빌드 및 ECR 푸시 완료: $FULL_IMAGE_URI"
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    name: ECS 프로덕션 배포
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    environment:
+      name: production
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 📋 환경변수 설정
+        run: |
+          # 기본 환경변수 설정
+          echo "AWS_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+          echo "GOOGLE_CHAT_WEBHOOK_URL=${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}" >> $GITHUB_ENV
+
+          SERVICE_NAME=erp-service
+
+          # ECR 리포지토리 설정 (primes/서비스명 형식)
+          if [ -n "${{ secrets.ECR_REPOSITORY }}" ]; then
+            echo "ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}" >> $GITHUB_ENV
+          else
+            # 기본값: primes/erp-service
+            echo "ECR_REPOSITORY=primes/${SERVICE_NAME}" >> $GITHUB_ENV
+            echo "✅ ECR 리포지토리를 설정했습니다: primes/${SERVICE_NAME}"
+          fi
+
+          # ECS 클러스터 설정
+          if [ -n "${{ secrets.ECS_CLUSTER }}" ]; then
+            echo "ECS_CLUSTER=${{ secrets.ECS_CLUSTER }}" >> $GITHUB_ENV
+          else
+            # 기본값: primes
+            echo "ECS_CLUSTER=primes" >> $GITHUB_ENV
+            echo "✅ ECS 클러스터를 설정했습니다: primes"
+          fi
+
+          # ECS 서비스 설정
+          if [ -n "${{ secrets.ECS_SERVICE }}" ]; then
+            echo "ECS_SERVICE=${{ secrets.ECS_SERVICE }}" >> $GITHUB_ENV
+          else
+            # 기본값: primes-erp-service
+            ECS_SERVICE="primes-${SERVICE_NAME}"
+            echo "ECS_SERVICE=$ECS_SERVICE" >> $GITHUB_ENV
+            echo "✅ ECS 서비스를 설정했습니다: $ECS_SERVICE"
+          fi
+
+          # ECS 태스크 정의 설정
+          if [ -n "${{ secrets.ECS_TASK_DEFINITION }}" ]; then
+            echo "ECS_TASK_DEFINITION=${{ secrets.ECS_TASK_DEFINITION }}" >> $GITHUB_ENV
+          else
+            # 기본값: primes-erp
+            ECS_TASK_DEF="primes-erp"
+            echo "ECS_TASK_DEFINITION=$ECS_TASK_DEF" >> $GITHUB_ENV
+            echo "✅ ECS 태스크 정의를 설정했습니다: $ECS_TASK_DEF"
+          fi
+
+          # ECS 컨테이너 이름 설정
+          if [ -n "${{ secrets.ECS_CONTAINER_NAME }}" ]; then
+            echo "ECS_CONTAINER_NAME=${{ secrets.ECS_CONTAINER_NAME }}" >> $GITHUB_ENV
+          else
+            # 기본값: erp-service-container
+            ECS_CONTAINER="${SERVICE_NAME}-container"
+            echo "ECS_CONTAINER_NAME=$ECS_CONTAINER" >> $GITHUB_ENV
+            echo "✅ ECS 컨테이너 이름을 설정했습니다: $ECS_CONTAINER"
+          fi
+
+          echo "=== 설정된 환경변수 ==="
+          echo "서비스명: ${SERVICE_NAME}"
+          echo "ECR_REPOSITORY: primes/${SERVICE_NAME}"
+          echo "ECS_CLUSTER: primes"
+          echo "ECS_SERVICE: primes-${SERVICE_NAME}"
+          echo "ECS_TASK_DEFINITION: primes-erp"
+          echo "ECS_CONTAINER_NAME: ${SERVICE_NAME}-container"
+
+      - name: ⚙️ AWS 자격 증명 설정
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔍 AWS 계정 ID 확인
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> $GITHUB_ENV
+          echo "현재 AWS 계정 ID: $AWS_ACCOUNT_ID"
+
+      - name: 📥 이미지 URI를 환경변수로 설정
+        run: |
+          # deploy 잡에서 이미지 정보를 재구성 (build 잡과 동일한 로직)
+          ECR_REGISTRY="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          ECR_REPOSITORY="${{ env.ECR_REPOSITORY }}"
+
+          # 이미지 태그 재생성 (build 잡과 동일한 로직)
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            IMAGE_TAG="${GITHUB_REF#refs/tags/}"
+          else
+            IMAGE_TAG="${GITHUB_SHA::8}"
+          fi
+
+          DOCKER_IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "DOCKER_IMAGE_URI=$DOCKER_IMAGE_URI" >> $GITHUB_ENV
+          echo "✅ 환경변수 설정: DOCKER_IMAGE_URI=$DOCKER_IMAGE_URI"
+
+      - name: "🔍 디버깅: 이미지 URI 확인"
+        run: |
+          echo "=== 환경변수 기반 이미지 URI 확인 ==="
+          echo "DOCKER_IMAGE_URI: ${{ env.DOCKER_IMAGE_URI }}"
+          if [ -z "${{ env.DOCKER_IMAGE_URI }}" ]; then
+            echo "❌ DOCKER_IMAGE_URI가 비어있습니다!"
+            exit 1
+          else
+            echo "✅ 이미지 URI 설정 성공!"
+          fi
+
+      - name: 🏗️ ECS 클러스터 확인 및 생성
+        run: |
+          echo "=== ECS 클러스터 확인: ${{ env.ECS_CLUSTER }} ==="
+
+          # ECS 클러스터 존재 확인
+          if aws ecs describe-clusters --clusters "${{ env.ECS_CLUSTER }}" --region ${{ env.AWS_REGION }} --query 'clusters[?status==`ACTIVE`]' --output text | grep -q "${{ env.ECS_CLUSTER }}"; then
+            echo "✅ ECS 클러스터 '${{ env.ECS_CLUSTER }}'가 이미 존재합니다."
+          else
+            echo "⚠️ ECS 클러스터 '${{ env.ECS_CLUSTER }}'가 존재하지 않습니다. 생성합니다..."
+            
+            # ECS 클러스터 생성
+            aws ecs create-cluster \
+              --cluster-name "${{ env.ECS_CLUSTER }}" \
+              --capacity-providers FARGATE \
+              --default-capacity-provider-strategy capacityProvider=FARGATE,weight=1 \
+              --region ${{ env.AWS_REGION }}
+            
+            echo "✅ ECS 클러스터 '${{ env.ECS_CLUSTER }}'를 성공적으로 생성했습니다."
+          fi
+
+      - name: 📜 CloudWatch 로그 그룹 확인 및 생성
+        run: |
+          LOG_GROUP="/ecs/${{ env.ECS_TASK_DEFINITION }}"
+          echo "=== CloudWatch Logs 로그 그룹 확인: $LOG_GROUP ==="
+          EXISTS=$(aws logs describe-log-groups \
+            --log-group-name-prefix "$LOG_GROUP" \
+            --region ${{ env.AWS_REGION }} \
+            --query "logGroups[?logGroupName=='$LOG_GROUP'] | length(@)" \
+            --output text || echo 0)
+          if [ "$EXISTS" != "0" ]; then
+            echo "✅ 로그 그룹 '$LOG_GROUP'가 이미 존재합니다."
+          else
+            echo "⚠️ 로그 그룹 '$LOG_GROUP'가 존재하지 않습니다. 생성합니다..."
+            aws logs create-log-group --log-group-name "$LOG_GROUP" --region ${{ env.AWS_REGION }}
+            # 보관 기간을 30일로 설정 (필요시 조정)
+            aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 30 --region ${{ env.AWS_REGION }} || true
+            echo "✅ 로그 그룹 '$LOG_GROUP' 생성 완료"
+          fi
+
+      - name: 📝 ECS 태스크 정의 확인 및 생성
+        run: |
+          echo "=== ECS 태스크 정의 확인: ${{ env.ECS_TASK_DEFINITION }} ==="
+
+          # ECS 태스크 정의 존재 확인
+          if aws ecs describe-task-definition --task-definition "${{ env.ECS_TASK_DEFINITION }}" --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "✅ ECS 태스크 정의 '${{ env.ECS_TASK_DEFINITION }}'가 이미 존재합니다."
+          else
+            echo "⚠️ ECS 태스크 정의 '${{ env.ECS_TASK_DEFINITION }}'가 존재하지 않습니다. 기본 태스크 정의를 생성합니다..."
+            
+            # ECS 태스크 실행 역할 확인 및 생성
+            EXECUTION_ROLE_NAME="ecsTaskExecutionRole"
+            EXECUTION_ROLE_ARN="arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/$EXECUTION_ROLE_NAME"
+            
+            if ! aws iam get-role --role-name "$EXECUTION_ROLE_NAME" 2>/dev/null; then
+              echo "⚠️ ECS 태스크 실행 역할이 존재하지 않습니다. 생성합니다..."
+              
+              # 신뢰 정책 생성
+              cat > trust-policy.json << TRUST_EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "ecs-tasks.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+              }
+            ]
+          }
+          TRUST_EOF
+              
+              # 역할 생성
+              aws iam create-role \
+                --role-name "$EXECUTION_ROLE_NAME" \
+                --assume-role-policy-document file://trust-policy.json
+              
+              # 관리형 정책 연결
+              aws iam attach-role-policy \
+                --role-name "$EXECUTION_ROLE_NAME" \
+                --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+              
+              echo "✅ ECS 태스크 실행 역할을 생성했습니다."
+            else
+              echo "✅ ECS 태스크 실행 역할이 이미 존재합니다."
+            fi
+            
+            # 기본 태스크 정의 생성
+            cat > initial-task-definition.json << EOF
+          {
+            "family": "${{ env.ECS_TASK_DEFINITION }}",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "512",
+            "memory": "1024",
+            "executionRoleArn": "$EXECUTION_ROLE_ARN",
+            "containerDefinitions": [
+              {
+                "name": "${{ env.ECS_CONTAINER_NAME }}",
+                "image": "${{ env.DOCKER_IMAGE_URI }}",
+                "portMappings": [
+                  {
+                    "containerPort": 8080,
+                    "protocol": "tcp"
+                  }
+                ],
+                "environment": [
+                  {
+                    "name": "SPRING_PROFILES_ACTIVE",
+                    "value": "prod"
+                  },
+                  {
+                    "name": "AWS_REGION",
+                    "value": "${{ env.AWS_REGION }}"
+                  }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/${{ env.ECS_TASK_DEFINITION }}",
+                    "awslogs-region": "${{ env.AWS_REGION }}",
+                    "awslogs-stream-prefix": "ecs",
+                    "awslogs-create-group": "true"
+                  }
+                },
+                "healthCheck": {
+                  "command": [
+                    "CMD-SHELL",
+                    "curl -f http://localhost:8080/actuator/health || exit 1"
+                  ],
+                  "interval": 30,
+                  "timeout": 5,
+                  "retries": 3,
+                  "startPeriod": 60
+                }
+              }
+            ]
+          }
+          EOF
+            
+            # 태스크 정의 등록
+            aws ecs register-task-definition \
+              --cli-input-json file://initial-task-definition.json \
+              --region ${{ env.AWS_REGION }}
+            
+            echo "✅ ECS 태스크 정의 '${{ env.ECS_TASK_DEFINITION }}'를 성공적으로 생성했습니다."
+          fi
+
+      - name: 🔧 ECS 서비스 확인 및 생성
+        run: |
+          echo "=== ECS 서비스 확인: ${{ env.ECS_SERVICE }} ==="
+
+          # ECS 서비스 존재 확인
+          if aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[?status==`ACTIVE`]' \
+            --output text | grep -q "${{ env.ECS_SERVICE }}"; then
+            echo "✅ ECS 서비스 '${{ env.ECS_SERVICE }}'가 이미 존재합니다."
+          else
+            echo "⚠️ ECS 서비스 '${{ env.ECS_SERVICE }}'가 존재하지 않습니다."
+            echo "🔍 실제 확인된 primes-erp-service-vmwe9vsl 설정을 기반으로 생성합니다..."
+            
+            # 실제 AWS CLI로 확인된 primes-erp-service-vmwe9vsl 설정 사용
+            SUBNETS="subnet-0bad7f28606eb72d8,subnet-087762f53021ab310,subnet-0d3b881c0e323fa94,subnet-08be52b1682fe02cd"
+            SECURITY_GROUPS="sg-004ee46a44c808ccc"
+            ASSIGN_PUBLIC_IP="ENABLED"
+            DESIRED_COUNT="1"
+            PLATFORM_VERSION="LATEST"
+            
+            # erp-service 서비스명으로 Service Discovery ARN 동적 조회
+            SERVICE_REGISTRY_ARN=$(aws servicediscovery list-services \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Services[?Name==`erp-service`].Arn' \
+              --output text)
+            
+            if [ -z "$SERVICE_REGISTRY_ARN" ]; then
+              echo "⚠️ erp-service Service Discovery를 찾을 수 없습니다. 자동 생성합니다..."
+              
+              # primes 네임스페이스 확인
+              NAMESPACE_ID="ns-bf5gowpi2htxndrv"  # 실제 확인된 primes 네임스페이스 ID
+              
+              # erp-service Service Discovery 생성
+              SERVICE_REGISTRY_ARN=$(aws servicediscovery create-service \
+                --name "erp-service" \
+                --namespace-id "$NAMESPACE_ID" \
+                --dns-config "RoutingPolicy=MULTIVALUE,DnsRecords=[{Type=A,TTL=5}]" \
+                --health-check-custom-config "FailureThreshold=1" \
+                --region ${{ env.AWS_REGION }} \
+                --query 'Service.Arn' \
+                --output text)
+              
+              if [ -n "$SERVICE_REGISTRY_ARN" ]; then
+                echo "✅ erp-service Service Discovery를 성공적으로 생성했습니다: $SERVICE_REGISTRY_ARN"
+              else
+                echo "❌ erp-service Service Discovery 생성에 실패했습니다."
+                exit 1
+              fi
+            else
+              echo "✅ 기존 erp-service Service Discovery를 찾았습니다: $SERVICE_REGISTRY_ARN"
+            fi
+            
+            echo "📋 사용할 네트워킹 설정 (AWS CLI로 확인된 실제 값):"
+            echo "  - 클러스터: ${{ env.ECS_CLUSTER }}"
+            echo "  - 서브넷: $SUBNETS"
+            echo "  - 보안그룹: $SECURITY_GROUPS"
+            echo "  - Public IP 할당: $ASSIGN_PUBLIC_IP"
+            echo "  - Desired Count: $DESIRED_COUNT"
+            echo "  - Platform Version: $PLATFORM_VERSION"
+            echo "  - 서비스 검색 레지스트리: $SERVICE_REGISTRY_ARN"
+            
+            # 새 ECS 서비스 생성 (Service Discovery 포함)
+            aws ecs create-service \
+              --cluster "${{ env.ECS_CLUSTER }}" \
+              --service-name "${{ env.ECS_SERVICE }}" \
+              --task-definition "${{ env.ECS_TASK_DEFINITION }}" \
+              --desired-count "$DESIRED_COUNT" \
+              --launch-type FARGATE \
+              --platform-version "$PLATFORM_VERSION" \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUPS],assignPublicIp=$ASSIGN_PUBLIC_IP}" \
+              --service-registries registryArn="$SERVICE_REGISTRY_ARN" \
+              --deployment-configuration "deploymentCircuitBreaker={enable=true,rollback=true},maximumPercent=200,minimumHealthyPercent=100" \
+              --region ${{ env.AWS_REGION }}
+            
+            echo "✅ ECS 서비스 '${{ env.ECS_SERVICE }}'를 실제 확인된 설정으로 성공적으로 생성했습니다."
+            
+            # 서비스가 안정될 때까지 대기
+            echo "⏳ 서비스 안정화를 위해 30초 대기..."
+            sleep 30
+          fi
+
+      - name: 📝 ECS 태스크 정의 다운로드
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --query taskDefinition > task-definition.json
+
+      - name: 태스크 정의 컨테이너 이름 확인
+        run: |
+          echo "=== 태스크 정의 내용 확인 ==="
+          cat task-definition.json | jq '.containerDefinitions[].name'
+
+          # 실제 컨테이너 이름 추출
+          ACTUAL_CONTAINER_NAME=$(cat task-definition.json | jq -r '.containerDefinitions[0].name')
+          echo "실제 컨테이너 이름: $ACTUAL_CONTAINER_NAME"
+          echo "설정된 컨테이너 이름: ${{ env.ECS_CONTAINER_NAME }}"
+
+          # 실제 컨테이너 이름을 환경변수로 설정
+          echo "ACTUAL_CONTAINER_NAME=$ACTUAL_CONTAINER_NAME" >> $GITHUB_ENV
+
+      - name: 🔄 새 이미지 URI로 태스크 정의 업데이트
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.ACTUAL_CONTAINER_NAME }}
+          image: ${{ env.DOCKER_IMAGE_URI }}
+          environment-variables: |
+            SPRING_PROFILES_ACTIVE=prod
+            AWS_REGION=${{ env.AWS_REGION }}
+
+      - name: 🚀 Amazon ECS 서비스 배포
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: 📢 Google Chat 배포 알림
+        if: always()
+        run: |
+          STATUS_EMOJI="✅"
+          STATUS_COLOR="#36a64f"
+          STATUS_TEXT="성공"
+
+          if [ "${{ job.status }}" != "success" ]; then
+            STATUS_EMOJI="❌"
+            STATUS_COLOR="#ff0000"
+            STATUS_TEXT="실패"
+          fi
+
+          # 이미지 URI가 비어있을 경우 기본값 설정
+          IMAGE_URI="${{ env.DOCKER_IMAGE_URI }}"
+          if [ -z "$IMAGE_URI" ]; then
+            IMAGE_URI="이미지 빌드 실패 또는 URI 설정되지 않음"
+          fi
+
+          # 브랜치/태그 정보
+          REF_NAME="${{ github.ref_name }}"
+          EVENT_NAME="${{ github.event_name }}"
+
+          # 워크플로우 URL
+          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          MESSAGE=$(cat <<EOF
+          {
+            "cards": [{
+              "header": {
+                "title": "$STATUS_EMOJI ECS 배포 알림 - $STATUS_TEXT",
+                "subtitle": "Primes erp API"
+              },
+              "sections": [{
+                "widgets": [{
+                  "keyValue": {
+                    "topLabel": "배포 결과",
+                    "content": "${{ job.status }} ($STATUS_TEXT)"
+                  }
+                }, {
+                  "keyValue": {
+                    "topLabel": "브랜치/태그",
+                    "content": "$REF_NAME ($EVENT_NAME)"
+                  }
+                }, {
+                  "keyValue": {
+                    "topLabel": "이미지 URI",
+                    "content": "$IMAGE_URI"
+                  }
+                }, {
+                  "keyValue": {
+                    "topLabel": "환경",
+                    "content": "Production"
+                  }
+                }, {
+                  "keyValue": {
+                    "topLabel": "ECS 클러스터",
+                    "content": "${{ env.ECS_CLUSTER || '설정되지 않음' }}"
+                  }
+                }, {
+                  "keyValue": {
+                    "topLabel": "ECS 서비스",
+                    "content": "${{ env.ECS_SERVICE || '설정되지 않음' }}"
+                  }
+                }, {
+                  "keyValue": {
+                    "topLabel": "커밋 해시",
+                    "content": "${{ github.sha }}"
+                  }
+                }, {
+                  "keyValue": {
+                    "topLabel": "작성자",
+                    "content": "${{ github.actor }}"
+                  }
+                }, {
+                  "keyValue": {
+                    "topLabel": "실행 시간",
+                    "content": "$(date '+%Y-%m-%d %H:%M:%S KST')"
+                  }
+                }]
+              }, {
+                "widgets": [{
+                  "buttons": [{
+                    "textButton": {
+                      "text": "🔗 워크플로우 로그 보기",
+                      "onClick": {
+                        "openLink": {
+                          "url": "$WORKFLOW_URL"
+                        }
+                      }
+                    }
+                  }]
+                }]
+              }]
+            }]
+          }
+          EOF
+          )
+
+          echo "📤 Google Chat 메시지 전송 중..."
+
+          RESPONSE=$(curl -s -w "HTTPSTATUS:%{http_code}" -X POST "${{ env.GOOGLE_CHAT_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "$MESSAGE")
+
+          HTTP_STATUS=$(echo $RESPONSE | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+          BODY=$(echo $RESPONSE | sed -E 's/HTTPSTATUS\:[0-9]{3}$//')
+
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "✅ Google Chat 알림이 성공적으로 전송되었습니다."
+          else
+            echo "❌ Google Chat 알림 전송 실패 (HTTP $HTTP_STATUS)"
+            echo "응답: $BODY"
+          fi
